@@ -3,6 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#1B2A4A">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="請求書提出">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'%3E%3Ccircle cx='60' cy='60' r='58' fill='white'/%3E%3Ccircle cx='60' cy='60' r='50' fill='none' stroke='%23BF3B30' stroke-width='8'/%3E%3Ccircle cx='60' cy='60' r='38' fill='none' stroke='%23BF3B30' stroke-width='3'/%3E%3Ctext x='60' y='74' font-size='40' text-anchor='middle' fill='%23BF3B30' font-family='serif'%3E請%3C/text%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'%3E%3Crect width='120' height='120' rx='24' fill='white'/%3E%3Ccircle cx='60' cy='60' r='48' fill='none' stroke='%23BF3B30' stroke-width='8'/%3E%3Ccircle cx='60' cy='60' r='36' fill='none' stroke='%23BF3B30' stroke-width='3'/%3E%3Ctext x='60' y='74' font-size='40' text-anchor='middle' fill='%23BF3B30' font-family='serif'%3E請%3C/text%3E%3C/svg%3E">
 <title>請求書提出システム</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
@@ -96,6 +103,7 @@
     font-family:var(--font-body);font-size:13.5px;color:var(--ink);background:#fff;
   }
   input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent);}
+  input::placeholder,textarea::placeholder{color:var(--ink-faint);opacity:.75;}
   textarea{resize:vertical;min-height:60px;}
   .checkbox-row{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink-soft);margin-top:6px;}
   .checkbox-row input{width:auto;}
@@ -454,6 +462,46 @@ function startNewDraft(){
   wizardStep = 1;
 }
 
+function duplicateInvoiceToNewDraft(record){
+  const destId = record.destSnapshot && record.destSnapshot.id;
+  const destOk = destId && getDestination(destId);
+  const contactIds = destOk
+    ? (record.contactsSnapshot || []).map(c => c.id).filter(cid => getContact(destId, cid))
+    : [];
+
+  const issueDate = todayIso();
+  draft = {
+    id: uid(),
+    destinationId: destOk ? destId : (destinations.length ? destinations[0].id : ''),
+    contactIds: contactIds,
+    lineItems: (record.lineItems && record.lineItems.length ? record.lineItems : [{}]).map(li => ({
+      id: uid(),
+      description: li.description || '',
+      quantity: li.quantity || '',
+      unit: li.unit || '日',
+      periods: [], // 対応期間は新しい日付になるはずなので、複製時は空にする
+      unitPrice: li.unitPrice || ''
+    })),
+    expenses: (record.expenses || []).map(ex => ({
+      id: uid(),
+      type: ex.type || '交通費',
+      description: ex.description || '',
+      amount: ex.amount || '',
+      usesShinkansenOrFlight: false,
+      receiptDataUrl: null,   // 領収書は複製されないため、再度添付が必要
+      receiptName: ''
+    })),
+    taxMode: record.taxMode || 'incl',
+    issueDate: issueDate,
+    dueDate: defaultDueDateFromIssue(issueDate),
+    dueDateTouched: false
+  };
+  wizardStep = 1;
+  closeHistoryDetail();
+  navigateTo('wizard');
+  showToast('過去の請求書を複製しました。内容を確認・編集してください（対応期間と領収書は再度ご入力ください）');
+}
+
 function lineItemSubtotal(li){
   const q = parseFloat(toHalfWidth(li.quantity)) || 0;
   const p = parseFloat(toHalfWidth(String(li.unitPrice).replace(/,/g,''))) || 0;
@@ -798,8 +846,8 @@ function renderProfile(){
     <div class="card">
       <h3><span class="num">1</span>基本情報</h3>
       <div class="grid grid-2">
-        <div class="field"><label>氏名（漢字）*</label><input type="text" value="${escapeHtml(f.fullNameKanji)}" oninput="profileForm.fullNameKanji=this.value" placeholder="押本 智恵"></div>
-        <div class="field"><label>氏名（カタカナ）*</label><input type="text" value="${escapeHtml(f.fullNameKana)}" oninput="profileForm.fullNameKana=this.value" placeholder="オシモト チエ"></div>
+        <div class="field"><label>氏名（漢字）*</label><input type="text" value="${escapeHtml(f.fullNameKanji)}" oninput="profileForm.fullNameKanji=this.value" placeholder="山田 太郎"></div>
+        <div class="field"><label>氏名（カタカナ）*</label><input type="text" value="${escapeHtml(f.fullNameKana)}" oninput="profileForm.fullNameKana=this.value" placeholder="ヤマダ タロウ"></div>
         <div class="field"><label>法人名・屋号（あれば）</label><input type="text" value="${escapeHtml(f.companyName)}" oninput="profileForm.companyName=this.value"></div>
         <div class="field">
           <label>インボイス登録番号（あれば）</label>
@@ -846,7 +894,7 @@ function renderProfile(){
           </select>
         </div>
         <div class="field"><label>口座番号</label><input type="text" value="${escapeHtml(f.bank.accountNumber)}" oninput="profileForm.bank.accountNumber=this.value"></div>
-        <div class="field"><label>口座名義人（カナ推奨）</label><input type="text" value="${escapeHtml(f.bank.accountHolder)}" oninput="profileForm.bank.accountHolder=this.value" placeholder="オシモト チエ"></div>
+        <div class="field"><label>口座名義人（カナ推奨）</label><input type="text" value="${escapeHtml(f.bank.accountHolder)}" oninput="profileForm.bank.accountHolder=this.value" placeholder="ヤマダ タロウ"></div>
       </div>
     </div>
 
@@ -1236,8 +1284,11 @@ function renderStepLineItems(){
                 ${UNIT_OPTIONS.map(u => `<option ${u===li.unit?'selected':''}>${u}</option>`).join('')}
               </select>
             </div>
+            <div class="hint">※「4」は例です。実際に稼働した日数・回数などを入力してください</div>
           </div>
-          <div class="field"><label>単価</label><input type="text" value="${escapeHtml(li.unitPrice)}" oninput="updateLIPrice('${li.id}',this.value)" placeholder="16,000"></div>
+          <div class="field"><label>単価</label><input type="text" value="${escapeHtml(li.unitPrice)}" oninput="updateLIPrice('${li.id}',this.value)" placeholder="16,000">
+            <div class="hint">※「16,000」は例です。実際にご請求する単価を入力してください</div>
+          </div>
         </div>
 
         <div class="field" style="margin-top:10px;">
@@ -1308,9 +1359,12 @@ function renderStepExpenses(){
             </select>
           </div>
           <div class="field" style="grid-column:span 2;"><label>内容</label>
-            <input type="text" value="${escapeHtml(ex.description)}" oninput="updateEX('${ex.id}','description',this.value)" placeholder="例：新幹線 東京⇔郡山">
+            <input type="text" value="${escapeHtml(ex.description)}" oninput="updateEX('${ex.id}','description',this.value)" placeholder="例：〇〇イベント対応　新幹線 東京⇔郡山">
+            <div class="hint">※対応した案件名を書いてから内容を入れると分かりやすいです（例：〇〇イベント対応　新幹線 東京⇔郡山）</div>
           </div>
-          <div class="field"><label>金額</label><input type="text" value="${escapeHtml(ex.amount)}" oninput="updateEXAmount('${ex.id}',this.value)" placeholder="12,000"></div>
+          <div class="field"><label>金額</label><input type="text" value="${escapeHtml(ex.amount)}" oninput="updateEXAmount('${ex.id}',this.value)" placeholder="12,000">
+            <div class="hint">対応した案件にかかった${ex.type}の合計金額を入力してください</div>
+          </div>
         </div>
         ${ex.type === '交通費' ? `
           <div class="checkbox-row">
@@ -1680,10 +1734,16 @@ function renderHistoryModal(){
       <div class="btn-row">
         <button class="btn btn-primary" onclick="redownloadPdf('${inv.id}')">PDFを再ダウンロード</button>
         ${inv.pdfUrl ? `<a class="btn btn-ghost" href="${inv.pdfUrl}" target="_blank" rel="noopener">Drive上のPDFを開く</a>` : ''}
+        ${inv.submitterId === myUserId ? `<button class="btn btn-ghost" onclick="duplicateCurrentHistoryDetail()">この内容を複製して新規作成</button>` : ''}
         <button class="btn btn-ghost" onclick="closeHistoryDetail()">閉じる</button>
       </div>
     </div>
   </div>`;
+}
+
+function duplicateCurrentHistoryDetail(){
+  if (!historyDetail) return;
+  duplicateInvoiceToNewDraft(historyDetail);
 }
 
 async function redownloadPdf(id){
@@ -2120,7 +2180,7 @@ function renderAdminInvoices(){
 
     <div class="card">
       <div class="grid grid-3">
-        <div class="field"><label>提出者名で検索</label><input type="text" value="${escapeHtml(adminFilters.name)}" oninput="adminFilters.name=this.value" onblur="render();" placeholder="例：押本"></div>
+        <div class="field"><label>提出者名で検索</label><input type="text" value="${escapeHtml(adminFilters.name)}" oninput="adminFilters.name=this.value" onblur="render();" placeholder="例：山田"></div>
         <div class="field"><label>提出先</label>
           <select onchange="adminFilters.destId=this.value;render();">
             <option value="">すべて</option>
