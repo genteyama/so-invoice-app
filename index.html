@@ -330,6 +330,7 @@ let forgotForm = { email:'', phone:'', newPassword:'', newPasswordConfirm:'' };
 
 let destinations = [];           // 宛先マスタ（サーバーから取得）
 let myInvoices = null;           // 自分の請求書一覧（null=未取得）
+let myDrafts = null;             // 自分の下書き一覧（null=未取得）
 let adminUsersList = null;       // 管理者：全ユーザー一覧（null=未取得）
 let adminInvoicesList = null;    // 管理者：全請求書一覧（null=未取得）
 let adminPasswordMemory = '';    // 管理者モード中、今回入力したパスワードを一時保持（API呼び出しの都度使用）
@@ -698,7 +699,9 @@ function navigateTo(view){
   if (view === 'destinations') destForm = { companyName:'', honorific:'御中' };
   if (view === 'wizard' && !draft) startNewDraft();
   if (view === 'history'){ historySelection = new Set(); historyDetail = null; loadMyInvoices(); }
+  if (view === 'drafts'){ loadMyDrafts(); }
   if (view === 'dashboard' && myInvoices === null) loadMyInvoices();
+  if (view === 'dashboard' && myDrafts === null) loadMyDrafts();
   if (view === 'admin-invoices'){ historySelection = new Set(); historyDetail = null; loadAdminInvoices(); }
   if (view === 'admin-users') loadAdminUsers();
   render();
@@ -744,6 +747,7 @@ function renderHeader(){
   const navItems = [
     ['dashboard','ダッシュボード'],
     ['wizard','新しい請求書'],
+    ['drafts','下書き' + (myDrafts && myDrafts.length ? `（${myDrafts.length}）` : '')],
     ['history','提出履歴'],
     ['profile','登録情報']
   ];
@@ -1092,7 +1096,7 @@ async function loginUser(){
 function logoutUser(){
   clearRememberedSession();
   loggedIn = false; profile = null; myUserId = null; isAdmin = false; adminPasswordMemory = '';
-  myInvoices = null; adminUsersList = null; adminInvoicesList = null;
+  myInvoices = null; myDrafts = null; adminUsersList = null; adminInvoicesList = null;
   authView = 'login';
   currentView = 'dashboard';
   render();
@@ -1189,6 +1193,84 @@ function goStep(n){
   wizardStep = n;
   render();
   window.scrollTo(0,0);
+  autoSaveDraft();
+}
+
+function draftPayloadForSave(){
+  const { destSnapshot } = snapshotForInvoice(draft);
+  const { total } = computeTotals(draft);
+  return {
+    destinationId: draft.destinationId, contactIds: draft.contactIds,
+    lineItems: draft.lineItems,
+    expenses: draft.expenses.map(ex => ({ id: ex.id, type: ex.type, description: ex.description, amount: ex.amount, usesShinkansenOrFlight: ex.usesShinkansenOrFlight })), // 領収書は下書きに保存されません（サイズ制限のため）
+    taxMode: draft.taxMode, issueDate: draft.issueDate, dueDate: draft.dueDate, dueDateTouched: draft.dueDateTouched,
+    wizardStep: wizardStep,
+    emailSubject: draft.emailSubject != null ? draft.emailSubject : null,
+    emailBody: draft.emailBody != null ? draft.emailBody : null,
+    destName: destSnapshot ? destSnapshot.name : '', total: total
+  };
+}
+
+async function autoSaveDraft(){
+  if (!draft || !profile) return;
+  try{
+    const res = await callApi('saveDraft', { id: myUserId, password: profile.password, draftId: draft.savedDraftId || null, record: draftPayloadForSave() });
+    if (res.ok && res.draftId) draft.savedDraftId = res.draftId;
+    myDrafts = null; // 一覧は次回表示時に最新化
+  }catch(e){ /* 自動保存の失敗は静かに無視する */ }
+}
+
+async function saveDraftAndPause(){
+  if (!draft) return;
+  showToast('下書きを保存しています…');
+  await autoSaveDraft();
+  showToast('下書きを保存しました');
+  draft = null;
+  navigateTo('drafts');
+}
+
+async function loadMyDrafts(){
+  const res = await callApi('getMyDrafts', { id: myUserId, password: profile.password });
+  if (res.ok) myDrafts = res.drafts;
+  else { myDrafts = []; showToast(res.error || '読み込みに失敗しました'); }
+  render();
+}
+
+async function resumeDraft(draftId){
+  showToast('下書きを読み込んでいます…');
+  const res = await callApi('getDraftDetail', { id: myUserId, password: profile.password, draftId: draftId });
+  if (!res.ok){ showToast(res.error || '取得に失敗しました'); return; }
+  const r = res.record || {};
+  draft = {
+    id: uid(),
+    savedDraftId: draftId,
+    destinationId: r.destinationId || (destinations[0] ? destinations[0].id : ''),
+    contactIds: r.contactIds || [],
+    lineItems: (r.lineItems && r.lineItems.length ? r.lineItems : [newLineItem()]),
+    expenses: (r.expenses || []).map(ex => ({ ...ex, receiptDataUrl: null, receiptName: '' })),
+    taxMode: r.taxMode || 'incl',
+    issueDate: r.issueDate || todayIso(),
+    dueDate: r.dueDate || defaultDueDateFromIssue(r.issueDate || todayIso()),
+    dueDateTouched: !!r.dueDateTouched,
+    emailSubject: r.emailSubject != null ? r.emailSubject : null,
+    emailBody: r.emailBody != null ? r.emailBody : null
+  };
+  wizardStep = r.wizardStep || 1;
+  if (wizardStep < 1 || wizardStep > 6) wizardStep = 1;
+  navigateTo('wizard');
+  if ((r.expenses||[]).some(ex => ex.usesShinkansenOrFlight || ex.type==='宿泊費' || ex.type==='立替経費')){
+    showToast('下書きを読み込みました。領収書は保存されないため、再度添付してください');
+  } else {
+    showToast('下書きを読み込みました');
+  }
+}
+
+async function deleteDraftById(draftId){
+  if (!window.confirm('この下書きを削除しますか？この操作は元に戻せません。')) return;
+  const res = await callApi('deleteDraft', { id: myUserId, password: profile.password, draftId: draftId });
+  if (!res.ok){ showToast(res.error || '削除に失敗しました'); return; }
+  showToast('下書きを削除しました');
+  await loadMyDrafts();
 }
 
 function validateStep(step){
@@ -1223,9 +1305,12 @@ function renderWizard(){
 
   return `
   <div class="page">
-    <div class="page-head">
-      <div class="eyebrow">New Invoice</div>
-      <h2>新しい請求書を作成</h2>
+    <div class="page-head" style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+      <div>
+        <div class="eyebrow">New Invoice</div>
+        <h2>新しい請求書を作成</h2>
+      </div>
+      ${wizardStep <= 6 ? `<button class="btn btn-ghost btn-sm" onclick="saveDraftAndPause()">下書き保存して中断する</button>` : ''}
     </div>
     ${wizardStep <= 6 ? renderStepper() : ''}
     ${body}
@@ -1343,6 +1428,7 @@ function renderStepExpenses(){
   <div class="card">
     <h3><span class="num">③</span>諸経費（交通費・宿泊費・立替経費）</h3>
     <p class="small-muted" style="margin-top:-6px;">新幹線・飛行機・宿泊費・立替経費は領収書の添付が必要です。ICカード利用など領収書がない交通費のみ添付を省略できます。</p>
+    <div class="notice-banner">※「下書き保存して中断する」を使った場合、添付した領収書は保存されません。続きを編集するときに再度添付してください。</div>
     ${draft.expenses.length === 0 ? `<p class="small-muted">経費はまだ追加されていません。</p>` : ''}
     ${draft.expenses.map((ex, idx) => {
       const needsReceipt = ex.type === '宿泊費' || ex.type === '立替経費' || (ex.type === '交通費' && ex.usesShinkansenOrFlight);
@@ -1629,6 +1715,11 @@ async function submitInvoice(){
     openMailDraft(defaults.toList, finalSubject, finalBody);
   }
 
+  if (draft.savedDraftId){
+    callApi('deleteDraft', { id: myUserId, password: profile.password, draftId: draft.savedDraftId }).catch(()=>{});
+    myDrafts = null;
+  }
+
   myInvoices = null; // 次に表示するときに最新化
   window.__lastSubmitEmailSent = !!res.emailSent;
   draft = null;
@@ -1637,6 +1728,38 @@ async function submitInvoice(){
 }
 
 /* ===================== 提出履歴（自分の分） ===================== */
+/* ===================== 下書き一覧 ===================== */
+function renderDrafts(){
+  if (myDrafts === null){
+    return `<div class="page"><div class="loading-screen" style="min-height:40vh;"><div>読み込み中…</div></div></div>`;
+  }
+  const sorted = myDrafts.slice().sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  return `
+  <div class="page">
+    <div class="page-head">
+      <div class="eyebrow">Drafts</div>
+      <h2>下書き</h2>
+      <p>作成途中の請求書です。ステップを進むたびに自動保存されます。続きから編集できます。<br>※添付した領収書は下書きには保存されません。編集を再開したときに再度添付してください。</p>
+    </div>
+    ${sorted.length === 0 ? `
+      <div class="empty-state">
+        <p>下書きはありません。</p>
+        <button class="btn btn-primary" onclick="requireProfileThen('wizard')">＋ 新しい請求書を作成</button>
+      </div>` : sorted.map(d => `
+        <div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;">
+          <div>
+            <div style="font-weight:700;">${escapeHtml(d.destName || '（宛先未選択）')}</div>
+            <div class="small-muted">最終更新：${new Date(d.updatedAt).toLocaleString('ja-JP')}　／　金額（現時点）：${formatYen(d.total)}</div>
+          </div>
+          <div class="btn-row" style="margin-top:0;">
+            <button class="btn btn-primary btn-sm" onclick="resumeDraft('${d.id}')">編集を続ける</button>
+            <button class="btn btn-danger-ghost btn-sm" onclick="deleteDraftById('${d.id}')">削除</button>
+          </div>
+        </div>
+      `).join('')}
+  </div>`;
+}
+
 function renderHistory(){
   if (myInvoices === null){
     return `<div class="page"><div class="loading-screen" style="min-height:40vh;"><div>読み込み中…</div></div></div>`;
@@ -2269,6 +2392,7 @@ function render(){
   else if (currentView === 'destinations') html += renderDestinations();
   else if (currentView === 'wizard') html += renderWizard();
   else if (currentView === 'history') html += renderHistory();
+  else if (currentView === 'drafts') html += renderDrafts();
   else if (currentView === 'admin-users') html += renderAdminUsers();
   else if (currentView === 'admin-invoices') html += renderAdminInvoices();
   document.getElementById('root').innerHTML = html;
