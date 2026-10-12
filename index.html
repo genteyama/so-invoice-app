@@ -92,7 +92,9 @@
   .grid{display:grid;gap:14px;}
   .grid-2{grid-template-columns:1fr 1fr;}
   .grid-3{grid-template-columns:1fr 1fr 1fr;}
-  @media (max-width:640px){.grid-2,.grid-3{grid-template-columns:1fr;}}
+  .span-2{grid-column:span 2;}
+  .grid > .field{min-width:0;}
+  @media (max-width:640px){.grid-2,.grid-3{grid-template-columns:1fr;}.span-2{grid-column:auto;}}
 
   label{display:block;font-size:12px;color:var(--ink-soft);margin-bottom:5px;font-weight:600;}
   .field{margin-bottom:2px;}
@@ -381,10 +383,14 @@ function formatDateSlash(iso){
   const [y,m,d] = iso.split('-');
   return `${y}/${m}/${d}`;
 }
-function todayIso(){ return new Date().toISOString().slice(0,10); }
+function localIso(d){
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function todayIso(){ return localIso(new Date()); }
 
 function lastDayOfMonthIso(year, monthIndex0){
-  return new Date(year, monthIndex0 + 1, 0).toISOString().slice(0,10);
+  return localIso(new Date(year, monthIndex0 + 1, 0));
 }
 function endOfPrevMonthIso(fromIso){
   const d = new Date(fromIso + 'T00:00:00');
@@ -506,7 +512,21 @@ function duplicateInvoiceToNewDraft(record){
 function lineItemSubtotal(li){
   const q = parseFloat(toHalfWidth(li.quantity)) || 0;
   const p = parseFloat(toHalfWidth(String(li.unitPrice).replace(/,/g,''))) || 0;
-  return q * p;
+  return Math.round(q * p);
+}
+
+// 数量：半角数字と小数点のみ（小数1桁まで）。全角は自動で半角に直す
+function sanitizeQuantity(v){
+  let s = toHalfWidth(String(v == null ? '' : v)).replace(/[．。]/g, '.');
+  s = s.replace(/[^0-9.]/g, '');
+  const i = s.indexOf('.');
+  if (i !== -1) s = s.slice(0, i + 1) + s.slice(i + 1).replace(/\./g, '').slice(0, 1);
+  if (s.startsWith('.')) s = '0' + s;
+  return s;
+}
+// 単価・金額：半角数字のみ（カンマなどは自動で取り除く）
+function sanitizeInteger(v){
+  return toHalfWidth(String(v == null ? '' : v)).replace(/[^0-9]/g, '');
 }
 
 function formatPeriods(periods){
@@ -517,7 +537,8 @@ function formatPeriods(periods){
 function invoiceRows(d){
   const rows = [];
   d.lineItems.forEach(li => {
-    const qtyLabel = (li.quantity !== '' && li.quantity !== null) ? `${toHalfWidth(li.quantity)} ${li.unit}` : li.unit;
+    const qn = parseFloat(toHalfWidth(li.quantity));
+    const qtyLabel = isNaN(qn) ? li.unit : `${qn} ${li.unit}`;
     rows.push({
       label: li.description || '（未入力）',
       periodLabel: formatPeriods(li.periods),
@@ -610,9 +631,6 @@ function buildSheetHTML(vm){
     <div class="top-row">
       <div class="to-block">
         <div class="company">${escapeHtml(destSnapshot.name)} ${escapeHtml(destSnapshot.honorific||'御中')}</div>
-        <div style="margin-top:10px;font-size:11.5px;color:#333;">
-          ${contactsSnapshot.map(c => `${escapeHtml(c.dept||'')} ${escapeHtml(c.name||'')} 様`).join('<br>')}
-        </div>
       </div>
       <div class="meta-block">
         <div>請求日 ： ${formatDateJp(issueDate)}</div>
@@ -767,7 +785,7 @@ function renderHeader(){
       <div class="app-nav">
         ${navItems.map(([key,label]) => `<button class="${currentView===key?'active':''}" onclick="navigateTo('${key}')">${label}</button>`).join('')}
       </div>
-      <div style="display:flex;align-items:center;gap:8px;">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
         <div class="user-pill">${escapeHtml(profile.fullNameKanji)} さん</div>
         <button class="btn btn-ghost btn-sm" onclick="logoutUser()">ログアウト</button>
         <button class="btn btn-sm ${isAdmin?'btn-dark':'btn-ghost'}" onclick="toggleAdminMode()">${isAdmin ? '管理者モード：終了' : '管理者ログイン'}</button>
@@ -1283,6 +1301,7 @@ function validateStep(step){
     for (const li of draft.lineItems){
       if (!li.description) return '明細の対応内容を入力してください';
       if (!li.quantity || !li.unitPrice) return '数量と単価を入力してください';
+      if (!(parseFloat(toHalfWidth(li.quantity)) > 0)) return '数量は0より大きい数字で入力してください';
     }
   }
   if (step === 3){
@@ -1359,20 +1378,20 @@ function renderStepLineItems(){
           ${draft.lineItems.length > 1 ? `<button class="btn btn-danger-ghost btn-sm" onclick="removeLineItem('${li.id}')">削除</button>` : ''}
         </div>
         <div class="grid grid-2">
-          <div class="field" style="grid-column:span 2;"><label>対応内容</label>
+          <div class="field span-2"><label>対応内容</label>
             <input type="text" value="${escapeHtml(li.description)}" oninput="updateLI('${li.id}','description',this.value)" placeholder="例：CSPO2025ふくしまフェア／ブース対応費">
           </div>
           <div class="field"><label>数量</label>
             <div style="display:flex;gap:6px;">
-              <input type="text" style="flex:1;" value="${escapeHtml(li.quantity)}" oninput="updateLIQty('${li.id}',this.value)" placeholder="4">
-              <select style="flex:1;" onchange="updateLI('${li.id}','unit',this.value)">
+              <input type="text" inputmode="decimal" autocomplete="off" style="flex:2;min-width:0;" value="${escapeHtml(li.quantity)}" oninput="onQtyInput(this,'${li.id}',event)" oncompositionend="onQtyInput(this,'${li.id}',event)" onblur="onQtyInput(this,'${li.id}',event,true)" placeholder="4">
+              <select style="flex:1;min-width:0;" onchange="updateLI('${li.id}','unit',this.value)">
                 ${UNIT_OPTIONS.map(u => `<option ${u===li.unit?'selected':''}>${u}</option>`).join('')}
               </select>
             </div>
-            <div class="hint">※「4」は例です。実際に稼働した日数・回数などを入力してください</div>
+            <div class="hint">※「4」は例です。実際に稼働した日数・回数を半角数字で入力してください（半日は 0.5、1日半は 1.5 のように、小数点1桁まで入力できます）</div>
           </div>
-          <div class="field"><label>単価</label><input type="text" value="${escapeHtml(li.unitPrice)}" oninput="updateLIPrice('${li.id}',this.value)" placeholder="16,000">
-            <div class="hint">※「16,000」は例です。実際にご請求する単価を入力してください</div>
+          <div class="field"><label>単価</label><input type="text" inputmode="numeric" autocomplete="off" value="${escapeHtml(li.unitPrice)}" oninput="onIntInput(this,'price','${li.id}',event)" oncompositionend="onIntInput(this,'price','${li.id}',event)" placeholder="16,000">
+            <div class="hint">※「16,000」は例です。実際にご請求する単価を半角数字で入力してください</div>
           </div>
         </div>
 
@@ -1400,6 +1419,19 @@ function renderStepLineItems(){
   </div>`;
 }
 function updateLI(id, field, value){ const li = draft.lineItems.find(x=>x.id===id); li[field]=value; }
+function onQtyInput(el, id, e, final){
+  if (e && e.isComposing && !final) return;
+  let clean = sanitizeQuantity(el.value);
+  if (final && clean.endsWith('.')) clean = clean.slice(0, -1);
+  if (clean !== el.value) el.value = clean;
+  updateLIQty(id, clean);
+}
+function onIntInput(el, kind, id, e){
+  if (e && e.isComposing) return;
+  const clean = sanitizeInteger(el.value);
+  if (clean !== el.value) el.value = clean;
+  if (kind === 'price') updateLIPrice(id, clean); else updateEXAmount(id, clean);
+}
 function updateLIQty(id, value){ const li = draft.lineItems.find(x=>x.id===id); li.quantity=value; patchLineItemSubtotal(li); }
 function updateLIPrice(id, value){ const li = draft.lineItems.find(x=>x.id===id); li.unitPrice=value; patchLineItemSubtotal(li); }
 function patchLineItemSubtotal(li){
@@ -1444,11 +1476,11 @@ function renderStepExpenses(){
               ${EXPENSE_TYPES.map(t => `<option ${t===ex.type?'selected':''}>${t}</option>`).join('')}
             </select>
           </div>
-          <div class="field" style="grid-column:span 2;"><label>内容</label>
+          <div class="field span-2"><label>内容</label>
             <input type="text" value="${escapeHtml(ex.description)}" oninput="updateEX('${ex.id}','description',this.value)" placeholder="例：〇〇イベント対応　新幹線 東京⇔郡山">
             <div class="hint">※対応した案件名を書いてから内容を入れると分かりやすいです（例：〇〇イベント対応　新幹線 東京⇔郡山）</div>
           </div>
-          <div class="field"><label>金額</label><input type="text" value="${escapeHtml(ex.amount)}" oninput="updateEXAmount('${ex.id}',this.value)" placeholder="12,000">
+          <div class="field"><label>金額</label><input type="text" inputmode="numeric" autocomplete="off" value="${escapeHtml(ex.amount)}" oninput="onIntInput(this,'amount','${ex.id}',event)" oncompositionend="onIntInput(this,'amount','${ex.id}',event)" placeholder="12,000">
             <div class="hint">対応した案件にかかった${ex.type}の合計金額を入力してください</div>
           </div>
         </div>
@@ -1935,6 +1967,24 @@ function registerJapaneseFont(pdf){
   pdf.setFont('MPLUS1p');
 }
 
+function wrapTextByWidth(pdf, text, maxW){
+  const NO_HEAD = '、。，．）」』】〉》〕］｝ー・：；！？,.)]}!?:;';
+  const out = [];
+  String(text == null ? '' : text).split(/\r?\n/).forEach(para => {
+    let line = '';
+    for (const ch of Array.from(para)){
+      if (line && pdf.getTextWidth(line + ch) > maxW && NO_HEAD.indexOf(ch) === -1){
+        out.push(line);
+        line = ch;
+      } else {
+        line += ch;
+      }
+    }
+    out.push(line);
+  });
+  return out.length ? out : [''];
+}
+
 function drawInvoiceOnPage(pdf, vm){
   const { rows, internal, tax, total, issueDate, dueDate, profileSnapshot, destSnapshot, contactsSnapshot } = vm;
   const bank = profileSnapshot.bank || {};
@@ -1955,18 +2005,11 @@ function drawInvoiceOnPage(pdf, vm){
   pdf.setLineWidth(0.5);
   pdf.line(ML, 46.5, ML + destW, 46.5);
 
-  pdf.setFontSize(9);
-  let contactY = 52;
-  (contactsSnapshot||[]).forEach(c => {
-    pdf.text(`${c.dept||''} ${c.name||''} 様`, ML, contactY);
-    contactY += 5;
-  });
-
   pdf.setFontSize(9.5);
   pdf.text(`請求日 ： ${formatDateJp(issueDate)}`, CR, 42, { align:'right' });
   pdf.text(`支払期限 ： ${formatDateJp(dueDate)}`, CR, 47.5, { align:'right' });
 
-  let y = Math.max(contactY + 3, 58);
+  let y = 58;
 
   pdf.setFontSize(9.5);
   pdf.text('平素は格別のご高配を賜り厚く御礼申し上げます。', ML, y); y += 5;
@@ -2001,18 +2044,23 @@ function drawInvoiceOnPage(pdf, vm){
   const cEnd = CR;
 
   const headerH = 8;
-  pdf.setFillColor(239,239,239);
-  pdf.rect(ML, y, tableW, headerH, 'F');
-  pdf.setDrawColor(150,150,150);
-  pdf.setLineWidth(0.3);
-  pdf.rect(ML, y, tableW, headerH);
-  pdf.setFontSize(9.5);
-  pdf.setTextColor(20,20,20);
-  pdf.text('件名 / 品目', cDesc+3, y+5.5);
-  pdf.text('数量', cQty-3, y+5.5, { align:'right' });
-  pdf.text('単価', cPrice-3, y+5.5, { align:'right' });
-  pdf.text('金額', cEnd-3, y+5.5, { align:'right' });
-  y += headerH;
+  const PAGE_BOTTOM = 290;  // 本文を入れてよい下端（mm）
+  const FOOT_H = 58;        // 表の下に必要な高さ（合計欄＋お振込先）
+  const drawTableHeader = () => {
+    pdf.setFillColor(239,239,239);
+    pdf.rect(ML, y, tableW, headerH, 'F');
+    pdf.setDrawColor(150,150,150);
+    pdf.setLineWidth(0.3);
+    pdf.rect(ML, y, tableW, headerH);
+    pdf.setFontSize(9.5);
+    pdf.setTextColor(20,20,20);
+    pdf.text('件名 / 品目', cDesc+3, y+5.5);
+    pdf.text('数量', cPrice-3, y+5.5, { align:'right' });
+    pdf.text('単価', cAmount-3, y+5.5, { align:'right' });
+    pdf.text('金額', cEnd-3, y+5.5, { align:'right' });
+    y += headerH;
+  };
+  drawTableHeader();
 
   const descMaxW = (cQty - cDesc) - 6;
   const rowMinH = 12;
@@ -2020,13 +2068,30 @@ function drawInvoiceOnPage(pdf, vm){
   const paddedRows = rows.slice();
   while (paddedRows.length < minRows) paddedRows.push(null);
 
-  paddedRows.forEach(r => {
+  paddedRows.forEach((r, idx) => {
     pdf.setFontSize(9.5);
     let lines = [''];
-    if (r) lines = pdf.splitTextToSize(r.label, descMaxW);
-    const hasPeriod = r && r.periodLabel;
-    const contentLines = lines.length + (hasPeriod ? 1 : 0);
-    const rowH = Math.max(rowMinH, 7 + (contentLines-1) * 4.6 + 4);
+    let periodLines = [];
+    if (r) lines = wrapTextByWidth(pdf, r.label, descMaxW);
+    if (r && r.periodLabel){
+      pdf.setFontSize(7);
+      periodLines = wrapTextByWidth(pdf, r.periodLabel, descMaxW);
+      pdf.setFontSize(9.5);
+    }
+    const hasPeriod = periodLines.length > 0;
+    const rowH = Math.max(rowMinH, 7 + (lines.length - 1) * 4.6 + periodLines.length * 3.6 + 4);
+    // ページに収まらない場合は、次のページに送る（最後の明細の下には合計欄・お振込先が入る余白を確保）
+    if (!r){
+      if (y + rowH + FOOT_H > PAGE_BOTTOM) return;   // 空行は余白があるときだけ描く
+    } else {
+      const reserve = (idx === rows.length - 1) ? FOOT_H : 0;
+      if (y + rowH + reserve > PAGE_BOTTOM){
+        pdf.addPage('a4', 'portrait');
+        pdf.setFont('MPLUS1p');
+        y = 20;
+        drawTableHeader();
+      }
+    }
     const firstLineY = y + 7;
 
     pdf.setDrawColor(200,200,200);
@@ -2043,12 +2108,12 @@ function drawInvoiceOnPage(pdf, vm){
       if (hasPeriod){
         pdf.setFontSize(7);
         pdf.setTextColor(110,110,110);
-        pdf.text(r.periodLabel, cDesc+3, ty);
+        periodLines.forEach(pl => { pdf.text(pl, cDesc+3, ty); ty += 3.6; });
         pdf.setTextColor(20,20,20);
       }
       pdf.setFontSize(9.5);
-      pdf.text(r.qty, cQty-3, firstLineY, { align:'right' });
-      if (r.unitPrice) pdf.text(formatYen(r.unitPrice), cPrice-3, firstLineY, { align:'right' });
+      pdf.text(r.qty, cPrice-3, firstLineY, { align:'right' });
+      if (r.unitPrice) pdf.text(formatYen(r.unitPrice), cAmount-3, firstLineY, { align:'right' });
       pdf.text(formatYen(r.amount), cEnd-3, firstLineY, { align:'right' });
     }
     y += rowH;
