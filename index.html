@@ -277,13 +277,14 @@ async function callApi(action, payload, bulkBody){
     const text = await res.text();
     let parsed;
     try{ parsed = JSON.parse(text); }
-    catch(e){ return { ok:false, error:'サーバー応答の解析に失敗しました：' + text.slice(0,120) }; }
+    catch(e){ return { ok:false, uncertain:true, error:'サーバー応答の解析に失敗しました：' + text.slice(0,120) }; }
     if (parsed && parsed.via === 'GET'){
       console.warn('注意：このリクエスト（' + action + '）はPOSTではなくGETとして処理されました。');
     }
     return parsed;
   }catch(e){
-    return { ok:false, error:'通信に失敗しました：' + e.message };
+    const kind = (e && e.name) ? e.name + '：' : '';
+    return { ok:false, uncertain:true, error:'通信に失敗しました（' + kind + (e && e.message ? e.message : '不明') + '）' };
   }
 }
 
@@ -342,6 +343,8 @@ let revealedPasswords = new Set();
 let currentView = 'dashboard';
 let wizardStep = 1;
 let draft = null;
+let submitting = false;      // 送信処理中（連打防止）
+let submitError = null;      // 送信に失敗したときの案内文
 let historySelection = new Set();
 let historyDetail = null;
 let adminFilters = { name:'', destId:'', status:'', from:'', to:'' };
@@ -1229,19 +1232,38 @@ function draftPayloadForSave(){
   };
 }
 
+// 下書きの保存・削除は、1件ずつ順番に実行する（通信が遅いときに、同じ下書きが重複して作られるのを防ぐ）
+let draftSaveChain = Promise.resolve();
 async function autoSaveDraft(){
-  if (!draft || !profile) return;
-  try{
-    const res = await callApi('saveDraft', { id: myUserId, password: profile.password, draftId: draft.savedDraftId || null, record: draftPayloadForSave() });
-    if (res.ok && res.draftId) draft.savedDraftId = res.draftId;
-    myDrafts = null; // 一覧は次回表示時に最新化
-  }catch(e){ /* 自動保存の失敗は静かに無視する */ }
+  if (!draft || !profile) return false;
+  const draftId = (draft.savedDraftId = draft.savedDraftId || draft.id);   // 画面側で決めたIDを使い続ける
+  const record = draftPayloadForSave();                                    // この時点の内容を確定させておく
+  const uidNow = myUserId, pw = profile.password;
+  let ok = false;
+  draftSaveChain = draftSaveChain.then(async () => {
+    try{
+      const res = await callApi('saveDraft', { id: uidNow, password: pw, draftId }, { record });
+      ok = !!(res && res.ok);
+      if (ok) myDrafts = null; // 一覧は次回表示時に最新化
+    }catch(e){ ok = false; }
+  });
+  await draftSaveChain;
+  return ok;
+}
+function queueDraftDelete(draftId){
+  const uidNow = myUserId, pw = profile && profile.password;
+  draftSaveChain = draftSaveChain.then(() => callApi('deleteDraft', { id: uidNow, password: pw, draftId }).catch(() => {}));
+  return draftSaveChain;
 }
 
 async function saveDraftAndPause(){
   if (!draft) return;
   showToast('下書きを保存しています…');
-  await autoSaveDraft();
+  const ok = await autoSaveDraft();
+  if (!ok){
+    showToast('下書きを保存できませんでした。通信状況をご確認のうえ、もう一度お試しください（入力内容は消えていません）');
+    return;
+  }
   showToast('下書きを保存しました');
   draft = null;
   navigateTo('drafts');
@@ -1617,15 +1639,26 @@ function renderStepConfirmSend(){
       「送信する」を押すと、PDFを添付した本物のメールが上記の宛先へ自動送信されます（あわせてご自身の控えメールも届きます）。メールソフトを開く必要はありません。
     </div>
   </div>
+  ${submitError ? `
+  <div class="notice-banner" style="margin-top:14px;background:var(--accent-soft);color:var(--accent);">
+    ${escapeHtml(submitError)}
+    ${window.__pendingPdf ? `<div style="margin-top:10px;"><button class="btn btn-ghost btn-sm" onclick="downloadPdfHolder('pending')">PDFを保存する</button></div>` : ''}
+  </div>` : ''}
   <div class="btn-row">
-    <button class="btn btn-ghost" onclick="goStep(5)">← 編集に戻る</button>
-    <button class="btn btn-primary" onclick="submitInvoice()">送信する</button>
+    <button class="btn btn-ghost" onclick="goStep(5)" ${submitting ? 'disabled' : ''}>← 編集に戻る</button>
+    <button class="btn btn-primary" onclick="submitInvoice()" ${submitting ? 'disabled' : ''}>${submitting ? '送信中…' : '送信する'}</button>
   </div>`;
 }
 
 /* ===================== Step 7: 完了 ===================== */
 function renderStepDone(){
-  const sent = !!window.__lastSubmitEmailSent;
+  const sent = window.__lastSubmitEmailSent;   // true / false / null
+  const caption = sent === true ? '請求書を送信しました' : (sent === null ? '請求書を保存しました' : '請求書を作成しました');
+  const sub = sent === true
+    ? 'PDFを添付したメールを宛先へ自動送信し、ご自身の控えメールもお送りしました。特に操作は不要です。'
+    : (sent === null
+      ? '請求書は保存されましたが、通信が不安定で、メールの送信結果をその場で確認できませんでした。ご自身の控えメールが届いているかご確認ください。届かない場合は、下の「PDFを保存する」でPDFを保存し、管理者にご連絡ください。'
+      : '自動送信に失敗したため、下書きメールを開きました。下の「PDFを保存する」でPDFを保存し、メールに添付して送信してください。');
   return `
   <div class="card">
     <div class="stamp-scene">
@@ -1634,11 +1667,10 @@ function renderStepDone(){
         <circle cx="60" cy="60" r="40" fill="none" stroke="var(--accent)" stroke-width="2"/>
         <text x="60" y="72" font-size="34" text-anchor="middle" fill="var(--accent)" font-family="var(--font-display)">提出済</text>
       </svg>
-      <div class="stamp-caption">${sent ? '請求書を送信しました' : '請求書を作成しました'}</div>
-      <div class="stamp-sub">${sent
-        ? 'PDFを添付したメールを宛先へ自動送信し、ご自身の控えメールもお送りしました。特に操作は不要です。'
-        : '自動送信に失敗したため、PDFのダウンロードと下書きメールの作成のみ行いました。開いたメールにPDFを添付して送信してください。'}</div>
+      <div class="stamp-caption">${caption}</div>
+      <div class="stamp-sub">${sub}</div>
       <div class="btn-row" style="margin-top:20px;">
+        ${window.__lastPdf ? `<button class="btn btn-ghost" onclick="downloadPdfHolder('last')">PDFを保存する</button>` : ''}
         <button class="btn btn-ghost" onclick="navigateTo('history')">提出履歴を見る</button>
         <button class="btn btn-primary" onclick="startNewDraft();navigateTo('wizard');">＋ 続けてもう1件作成</button>
       </div>
@@ -1690,7 +1722,54 @@ function extensionFromMime(mimeType, originalName){
   return '';
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function isMobileLike(){
+  const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+  return /iPhone|iPad|iPod|Android/i.test(ua) ||
+    ((navigator.maxTouchPoints || 0) > 1 && /Mac/i.test((navigator.platform) || ''));
+}
+
+// 通信エラーのとき、実はサーバーには保存されていた（返事だけ受け取れなかった）かを確認する
+async function findSavedInvoice(clientId, filename, total, startedAt){
+  for (let attempt = 0; attempt < 2; attempt++){
+    if (attempt > 0) await sleep(2500);
+    const r = await callApi('getMyInvoices', { id: myUserId, password: profile.password });
+    if (r && r.ok && Array.isArray(r.invoices)){
+      const hit = r.invoices.find(i => String(i.id) === String(clientId) ||
+        (i.filename === filename && Number(i.total) === Number(total) && new Date(i.createdAt).getTime() >= startedAt - 120000));
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+function describeSubmitError(res){
+  const detail = res.error || '';
+  if (res.uncertain){
+    return `通信がうまくいかず、提出を完了できませんでした（${detail}）。入力内容はそのまま残っています。電波の良い場所で、もう一度「送信する」を押してください（すでに保存されている場合は、重ねて提出されません）。どうしても送れない場合は、下の「PDFを保存する」でPDFを保存し、管理者にお送りください。`;
+  }
+  return `提出の保存に失敗しました：${detail}`;
+}
+
+function downloadPdfHolder(which){
+  const h = which === 'last' ? window.__lastPdf : window.__pendingPdf;
+  if (!h){ showToast('保存できるPDFがありません'); return; }
+  try{ h.pdf.save(h.filename + '.pdf'); }catch(e){ showToast('PDFの保存に失敗しました'); }
+}
+
 async function submitInvoice(){
+  if (submitting) return;
+  submitting = true; submitError = null;
+  render();
+  try{
+    await submitInvoiceInner();
+  } finally {
+    submitting = false;
+    render();
+  }
+}
+
+async function submitInvoiceInner(){
   const { profileSnapshot, destSnapshot, contactsSnapshot } = snapshotForInvoice(draft);
   const { rows, internal, tax, total } = computeTotals(draft);
   const filename = `請求書_${sanitizeFilename(profile.fullNameKanji)}_${draft.issueDate.replace(/-/g,'')}`;
@@ -1721,42 +1800,60 @@ async function submitInvoice(){
   };
 
   showToast('PDFを作成しています…');
-  let pdfBase64 = null;
+  let pdf, pdfBase64;
   try{
-    const pdf = buildInvoicePdfDoc(vmFromDraft(draft));
-    pdf.save(filename + '.pdf');
+    pdf = buildInvoicePdfDoc(vmFromDraft(draft));
     pdfBase64 = pdf.output('datauristring').split(',')[1];
   }catch(e){
-    showToast('PDF生成でエラーが発生しました。もう一度お試しください。');
+    submitError = 'PDFの作成でエラーが発生しました。もう一度お試しください。';
+    showToast('PDF生成でエラーが発生しました');
+    return;
+  }
+  window.__pendingPdf = { pdf, filename };
+
+  // 画面から送る内容は本文（POST）に入れ、URLには最小限の情報だけを載せる（スマホでの通信エラー対策）
+  showToast('送信・保存しています…（数秒かかります。そのままお待ちください）');
+  const startedAt = Date.now();
+  const clientId = draft.id;   // 同じ請求書の二重提出を、サーバー側で防ぐための目印
+  let res = await callApi(
+    'submitInvoice',
+    { id: myUserId, password: profile.password, clientId },
+    { record, emailSubject: finalSubject, emailBody: finalBody, pdfBase64, receipts }
+  );
+
+  if (!res.ok && res.uncertain){
+    // 返事を受け取れなかっただけで、サーバーには保存済みの可能性があるため確認する
+    showToast('通信状況を確認しています…');
+    const saved = await findSavedInvoice(clientId, filename, total, startedAt);
+    if (saved) res = { ok:true, emailSent:null, invoiceId: saved.id };
+  }
+  if (!res.ok){
+    submitError = describeSubmitError(res);   // 入力内容は保持し、やり直せるようにする
+    showToast('提出を完了できませんでした。画面の案内をご確認ください');
     return;
   }
 
-  showToast('送信・保存しています…');
-  const res = await callApi(
-    'submitInvoice',
-    { id: myUserId, password: profile.password, record, emailSubject: finalSubject, emailBody: finalBody },
-    { pdfBase64, receipts }
-  );
-  if (!res.ok){
-    showToast('提出の保存に失敗しました：' + (res.error || '')); 
-    return; // ドラフトは保持し、やり直せるようにする
-  }
-
-  if (!res.emailSent){
+  if (res.emailSent === false){
     // 自動送信ができなかった場合のみ、下書きメールを開くフォールバック
     openMailDraft(defaults.toList, finalSubject, finalBody);
   }
 
   if (draft.savedDraftId){
-    callApi('deleteDraft', { id: myUserId, password: profile.password, draftId: draft.savedDraftId }).catch(()=>{});
+    queueDraftDelete(draft.savedDraftId);
     myDrafts = null;
   }
 
+  // PDFの保存：パソコンは自動で保存。スマホ・タブレットは完了画面の「PDFを保存する」ボタンで保存
+  window.__lastPdf = window.__pendingPdf; window.__pendingPdf = null;
+  if (!isMobileLike()){
+    try{ window.__lastPdf.pdf.save(filename + '.pdf'); }catch(e){ /* 完了画面のボタンから保存できる */ }
+  }
+
   myInvoices = null; // 次に表示するときに最新化
-  window.__lastSubmitEmailSent = !!res.emailSent;
+  window.__lastSubmitEmailSent = res.emailSent;   // true=送信済み / false=自動送信に失敗 / null=保存済み（送信結果は未確認）
+  submitError = null;
   draft = null;
   wizardStep = 7;
-  render();
 }
 
 /* ===================== 提出履歴（自分の分） ===================== */
@@ -2158,7 +2255,7 @@ function drawInvoiceOnPage(pdf, vm){
 
 function buildInvoicePdfDoc(vm){
   const { jsPDF } = window.jspdf;
-  const pdf = new jsPDF({ unit:'mm', format:'a4', orientation:'portrait' });
+  const pdf = new jsPDF({ unit:'mm', format:'a4', orientation:'portrait', compress:true });
   registerJapaneseFont(pdf);
   drawInvoiceOnPage(pdf, vm);
   return pdf;
@@ -2166,7 +2263,7 @@ function buildInvoicePdfDoc(vm){
 
 function buildBulkInvoicePdfDoc(vms){
   const { jsPDF } = window.jspdf;
-  const pdf = new jsPDF({ unit:'mm', format:'a4', orientation:'portrait' });
+  const pdf = new jsPDF({ unit:'mm', format:'a4', orientation:'portrait', compress:true });
   registerJapaneseFont(pdf);
   vms.forEach((vm, i) => {
     if (i > 0) pdf.addPage('a4', 'portrait');
